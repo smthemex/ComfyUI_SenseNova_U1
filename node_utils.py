@@ -17,13 +17,20 @@ def clear_comfyui_cache():
             pipe.unpatch_model(device_to=torch.device("cpu"))
     except: pass
     mm.soft_empty_cache()
-    torch.cuda.empty_cache()
-    max_gpu_memory = torch.cuda.max_memory_allocated()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        max_gpu_memory = torch.cuda.max_memory_allocated()
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
+        max_gpu_memory = torch.xpu.max_memory_allocated()
     print(f"After Max GPU memory allocated: {max_gpu_memory / 1000 ** 3:.2f} GB")
 
 def gc_cleanup():
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
 
 
 def phi2narry(img):

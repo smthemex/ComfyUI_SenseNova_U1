@@ -1248,8 +1248,8 @@ class NEOChatModel(PreTrainedModel):
                 del indexes_image_text_uncondition, indexes_image_img_uncondition, indexes_image_condition
                 del past_key_values_cond_cfg, past_key_values_tu_cfg, past_key_values_iu_cfg
                 del attention_mask_condition, attention_mask_text_uncondition, attention_mask_img_uncondition
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+                torch.cuda.empty_cache() if torch.cuda.is_available() else (torch.xpu.empty_cache() if hasattr(torch, "xpu") and torch.xpu.is_available() else None)
+                torch.cuda.synchronize() if torch.cuda.is_available() else (torch.xpu.synchronize() if hasattr(torch, "xpu") and torch.xpu.is_available() else None)
                 
                 img_count += 1
                 print(f'All images is {max_images},Generated {img_count} images, {img_count / (time.time() - start_time):.2f} images per second')
@@ -1319,8 +1319,8 @@ class NEOChatModel(PreTrainedModel):
                 del outputs_cond, outputs_tu
 
         del past_key_values_cond, past_key_values_tu, past_key_values_iu
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else (torch.xpu.empty_cache() if hasattr(torch, "xpu") and torch.xpu.is_available() else None)
+        torch.cuda.synchronize() if torch.cuda.is_available() else (torch.xpu.synchronize() if hasattr(torch, "xpu") and torch.xpu.is_available() else None)
         return generated_text, generated_images
 
     @torch.no_grad()

@@ -4,6 +4,7 @@
 import numpy as np
 import torch
 import os
+import warnings
 from comfy_api.latest import  io
 import folder_paths
 
@@ -14,10 +15,47 @@ from .SenseNova.examples.interleave.inference import infer_sensenova_interleave,
 from .SenseNova.examples.vqa.inference import infer_sensenova_vqa
 
 
-device = torch.device(
-    "cuda:0") if torch.cuda.is_available() else torch.device(
-    "mps") if torch.backends.mps.is_available() else torch.device(
-    "cpu")
+# 设备检测：支持 CUDA、XPU、MPS，如果只有 CPU 则发出醒目警告
+def _detect_device():
+    """检测并返回最佳可用设备，支持 CUDA、XPU、MPS"""
+    # 优先检测 CUDA
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    
+    # 检测 XPU (Intel GPU)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu:0")
+    
+    # 检测 MPS (Apple Silicon)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    
+    # 只有 CPU 可用，发出醒目警告
+    warning_msg = """
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║                          ⚠️  WARNING: CPU MODE  ⚠️                           ║
+    ╠══════════════════════════════════════════════════════════════════════════════╣
+    ║  No GPU device detected! The model will run on CPU, which is EXTREMELY slow. ║
+    ║                                                                              ║
+    ║  Supported GPU devices:                                                      ║
+    ║    - NVIDIA CUDA (torch.cuda.is_available())                                ║
+    ║    - Intel XPU   (torch.xpu.is_available())                                 ║
+    ║    - Apple MPS   (torch.backends.mps.is_available())                        ║
+    ║                                                                              ║
+    ║  For optimal performance, please ensure:                                    ║
+    ║    1. GPU drivers are properly installed                                    ║
+    ║    2. PyTorch is installed with GPU support                                 ║
+    ║       - CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu121 ║
+    ║       - XPU:  pip install torch --index-url https://pytorch-extension.intel.com/ipex-whl-stable-xpu ║
+    ║                                                                              ║
+    ║  Running on CPU may take HOURS instead of SECONDS for image generation!     ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+    """
+    warnings.warn(warning_msg, UserWarning, stacklevel=2)
+    print(warning_msg)  # 确保警告一定会显示
+    return torch.device("cpu")
+
+device = _detect_device()
 
 MAX_SEED = np.iinfo(np.int32).max
 node_cr_path = os.path.dirname(os.path.abspath(__file__))
