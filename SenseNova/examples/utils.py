@@ -1,9 +1,8 @@
-from contextlib import nullcontext
-from diffusers.utils import is_accelerate_available
-from contextlib import AbstractContextManager, contextmanager
-from ..layer_streaming import LayerStreamingWrapper,SimpleLayerStreamingWrapper,ExpertStreamingWrapper
+
+from contextlib import  contextmanager
+from ..layer_streaming import SimpleLayerStreamingWrapper,ExpertStreamingWrapper
 from collections.abc import Iterator
-from typing import Callable, TypeVar
+from typing import TypeVar
 import gc
 import torch
 
@@ -66,35 +65,7 @@ def _streaming_model(
         except Exception:
             print("Host empty cache cleanup failed; ignoring.", exc_info=True)
 
-@contextmanager
-def _streaming_model_(
-    model: _M,
-    layers_attr: str,
-    target_device: torch.device,
-    prefetch_count: int,
-) -> Iterator[_M]:
-    """Wrap *model* with :class:`LayerStreamingWrapper`, yield it, then tear down."""
-    wrapped = LayerStreamingWrapper(
-        model,
-        layers_attr=layers_attr,
-        target_device=target_device,
-        prefetch_count=prefetch_count,
-    )
-    try:
-        yield wrapped  # type: ignore[misc]
-    finally:
-        wrapped.teardown()
-        cleanup_memory()
-        # Flush the host (pinned) memory cache so that freed pinned pages are
-        # returned to the OS.  Without this, sequential streaming models
-        # (e.g. text encoder then transformer) exhaust host memory because the
-        # CachingHostAllocator keeps freed blocks cached indefinitely.
-        torch.cuda.synchronize(device=target_device)
-        try:
-            if hasattr(torch._C, "_host_emptyCache"):
-                torch._C._host_emptyCache()
-        except Exception:
-            print("Host empty cache cleanup failed; ignoring.", exc_info=True)
+
 
 def set_gguf2meta_model(meta_model,model_state_dict,dtype,device,lora_sd=None):
     from diffusers import GGUFQuantizationConfig
