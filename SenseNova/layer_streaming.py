@@ -13,6 +13,11 @@ class ExpertOffloadMoEBlock(nn.Module):
     """
     同步卸载，支持自定义缓存容量：在 GPU 上最多同时保留 `cache_capacity` 个专家。
     gate 常驻 GPU，专家按需同步加载/卸载，采用 LRU 淘汰策略。
+
+    指针式（零拷贝）实现：每个专家的权威 CPU 权重引用在 __init__ 保存，
+    load 时 ``.to(device)`` 新建 GPU 张量（源稳定，不丢原始权重），
+    unload 时直接将 ``param.data`` 指回已保存的 CPU 引用（不新建 CPU 副本），
+    从而避免每次切换专家都产生无谓的 CPU 副本复制与 CUDA 分配器碎片累积。
     """
     def __init__(self, moe_block, target_device: torch.device, cache_capacity: int = 1):
         super().__init__()
@@ -22,6 +27,16 @@ class ExpertOffloadMoEBlock(nn.Module):
         # gate 常驻 GPU
         self.moe_block.gate.to(target_device)
         self._resident_experts: list[int] = []
+        # 每个专家的权威 CPU 权重引用（指针式卸载的基础）
+        self._expert_cpu_refs: dict[int, list[torch.Tensor]] = {}
+        for eid, expert in enumerate(self.moe_block.experts):
+            refs = []
+            for t in itertools.chain(expert.parameters(), expert.buffers()):
+                d = t.data
+                # 若专家权重已驻留在 GPU（上一轮残留），先搬回 CPU 再保存引用，
+                # 确保 _expert_cpu_refs 永远是真正的 CPU 张量，unload 零拷贝指回才正确。
+                refs.append(d if d.device.type == 'cpu' else d.to('cpu'))
+            self._expert_cpu_refs[eid] = refs
 
     # ----- 代理原始属性 -----
     @property
@@ -58,18 +73,22 @@ class ExpertOffloadMoEBlock(nn.Module):
         # 淘汰直至有空间
         self._evict_lru()
 
-        # 加载新专家
+        # 加载新专家：以权威 CPU 引用为源，新建 GPU 张量
         expert_module = self.moe_block.experts[eid]
-        for param in itertools.chain(expert_module.parameters(), expert_module.buffers()):
-            param.data = param.data.to(self.target_device)
+        refs = self._expert_cpu_refs[eid]
+        params = list(itertools.chain(expert_module.parameters(), expert_module.buffers()))
+        for param, ref in zip(params, refs):
+            param.data = ref.to(self.target_device)
         self._resident_experts.append(eid)
 
     def _unload_expert(self, eid: int):
-        """将指定专家从 GPU 移回 CPU。"""
+        """将指定专家从 GPU 移回 CPU（零拷贝：直接指回权威 CPU 引用）。"""
         expert_module = self.moe_block.experts[eid]
-        for param in itertools.chain(expert_module.parameters(), expert_module.buffers()):
-            param.data = param.data.to('cpu')
-      
+        refs = self._expert_cpu_refs[eid]
+        params = list(itertools.chain(expert_module.parameters(), expert_module.buffers()))
+        for param, ref in zip(params, refs):
+            param.data = ref
+
     def _unload_all(self):
         """卸载所有驻留专家，释放显存。"""
         for eid in list(self._resident_experts):
@@ -124,8 +143,9 @@ class ExpertStreamingWrapper(nn.Module):
         self._model = model
         self._target_device = target_device
         self._cache_capacity = cache_capacity
-        self._replace_map: dict[int, tuple[nn.Module, str, nn.Module]] = {}  
-
+        self._replace_map: dict[int, tuple[nn.Module, str, nn.Module]] = {}
+        # 非层参数的 CPU 原始权重引用（指针式搬运用）
+        self._non_layer_cpu_refs: dict[int, torch.Tensor] = {}
 
         expert_param_ids: set[int] = set()
         for module in model.modules():
@@ -143,12 +163,22 @@ class ExpertStreamingWrapper(nn.Module):
 
         self._replace_moe_blocks(model, target_device)
 
+        # 指针式搬运非层参数：首次新建 GPU 并保存 CPU 引用，之后同设备复用
+        def _ensure(param: torch.Tensor) -> None:
+            pid = id(param)
+            if pid not in self._non_layer_cpu_refs:
+                d = param.data
+                # 若权重已驻留在 GPU（上一轮残留），先搬回 CPU 再保存引用，
+                # 确保 _non_layer_cpu_refs 永远是真正的 CPU 张量，指针式复用才正确。
+                self._non_layer_cpu_refs[pid] = d if d.device.type == 'cpu' else d.to('cpu')
+            param.data = self._non_layer_cpu_refs[pid].to(self._target_device)
+
         for p in model.parameters():
             if id(p) not in expert_param_ids:
-                p.data = p.data.to(target_device)
+                _ensure(p)
         for b in model.buffers():
             if id(b) not in expert_param_ids:
-                b.data = b.data.to(target_device)
+                _ensure(b)
 
     def _replace_moe_blocks(self, module: nn.Module, target_device: torch.device):
         replacements = []
@@ -178,28 +208,41 @@ class ExpertStreamingWrapper(nn.Module):
         except AttributeError:
             return getattr(self._model, name)
         
-
 # edit from LayerStreamingWrapper from https://github.com/Lightricks/LTX-2
 
 class _SimpleLayerStore:
-    """简化版层存储，支持按需加载和立即释放"""
+    """简化版层存储，支持按需加载和立即释放（指针式：unload 零拷贝）"""
 
     def __init__(self, layers: nn.ModuleList, target_device: torch.device) -> None:
         self.target_device = target_device
         self.num_layers = len(layers)
+        self._resident: set[int] = set()
 
-        # 保留CPU端的原始参数引用
+        # 保留CPU端的原始参数引用（权威副本，永不被覆盖）
         self._cpu_params: list[dict[str, torch.Tensor]] = []
         for layer in layers:
             cpu_copy = {}
             for name, tensor in itertools.chain(layer.named_parameters(), layer.named_buffers()):
                 if tensor is None:
                     continue
-                cpu_copy[name] = tensor.data.cpu()  # 保留在CPU上
+                # 若层张量已驻留在 GPU（如上一轮常驻层残留），先搬回 CPU 再保存引用，
+                # 确保 _cpu_params 永远是真正的 CPU 张量，unload 时零拷贝指回才正确。
+                t = tensor.data
+                if t.device.type != 'cpu':
+                    t = t.to('cpu')
+                cpu_copy[name] = t
             self._cpu_params.append(cpu_copy)
 
-    def load_layer_to_gpu(self, idx: int, layer: nn.Module) -> None:
+    def set_resident(self, resident: set[int]) -> None:
+        self._resident = resident
+
+    def is_resident(self, idx: int) -> bool:
+        return idx in self._resident
+
+    def load_layer_to_gpu(self, idx: int, layer: nn.Module, force: bool = False) -> None:
         """将指定层加载到GPU"""
+        if idx in self._resident and not force:
+            return
         for name, param in itertools.chain(layer.named_parameters(), layer.named_buffers()):
             if param is None:
                 continue
@@ -207,12 +250,14 @@ class _SimpleLayerStore:
                 param.data = self._cpu_params[idx][name].to(self.target_device)
 
     def unload_layer_from_gpu(self, idx: int, layer: nn.Module) -> None:
-        """将指定层从GPU卸载回CPU"""
+        """将指定层从GPU卸载回CPU（零拷贝：直接指回权威CPU引用）"""
+        if idx in self._resident:
+            return
         for name, param in itertools.chain(layer.named_parameters(), layer.named_buffers()):
             if param is None:
                 continue
             if name in self._cpu_params[idx]:
-                param.data = self._cpu_params[idx][name]  # 恢复为CPU副本
+                param.data = self._cpu_params[idx][name]  # 恢复为CPU副本（同一引用，不新建）
 
 def _resolve_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
     """Resolve a dotted attribute path like ``'model.language_model.layers'``."""
@@ -224,14 +269,24 @@ def _resolve_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
     return obj
 
 class SimpleLayerStreamingWrapper(nn.Module):
-    """简化版层流式处理包装器"""
+    """简化版层流式处理包装器（指针式，对齐 FireRedAudio fast）
+
+    - 常驻层：``active_count >= 1`` 时前 ``active_count`` 层一次性加载到 GPU 并
+      不注册卸载钩子（不参与流式循环）；``active_count == 0`` 时全部层逐层流式。
+    - 层权重：``_SimpleLayerStore`` 保存权威 CPU 引用，load 时 ``.to(gpu)`` 新建
+      GPU 张量、unload 时零拷贝指回 CPU 引用（不新建）。
+    - 非层参数（dit/patch/embed/lm_head 等）：指针式复用，首次 ``.to(gpu)`` 新建
+      并保存 CPU 引用，之后 ``.to(gpu)`` 同设备返回自身（不复制），避免每次推理
+      反复重建导致 CUDA 分配器碎片累积（消除"冷启动快、连续推理变慢"）。
+    - post_hook 同步事件后主动 ``empty_cache()``，及时归还单层临时显存。
+    """
     
     def __init__(
         self,
         model: nn.Module,
         layers_attr: str,
         target_device: torch.device,
-        active_count: int = 1,  # 同时激活的层数量
+        active_count: int = 0,  # 常驻层数（>=1 常驻前 N 层；0 表示全流式）
     ) -> None:
         super().__init__()
         self._model = model
@@ -239,29 +294,51 @@ class SimpleLayerStreamingWrapper(nn.Module):
         self._target_device = target_device
         self._active_count = active_count
         self._store = _SimpleLayerStore(self._layers, self._target_device)
-        
-        # 将非层参数移到GPU
+
+        # 非层参数的 CPU 原始权重引用（指针式搬运用）
+        self._non_layer_cpu_refs: dict[int, torch.Tensor] = {}
+
+        n = len(self._layers)
+        if active_count is not None and active_count >= 0:
+            resident_count = min(active_count, n)
+            self._resident = set(range(resident_count))
+        else:
+            self._resident = set()
+        self._store.set_resident(self._resident)
+
+        # 将非层参数移到 GPU（指针式常驻）
         self._move_non_layer_params_to_gpu()
-        
-        # 注册钩子
+
+        # 常驻层强制加载到 GPU（不注册卸载钩子）
+        for idx in sorted(self._resident):
+            self._store.load_layer_to_gpu(idx, self._layers[idx], force=True)
+
+        # 注册钩子（仅非常驻层）
         self._register_simple_hooks()
     
     def _move_non_layer_params_to_gpu(self) -> None:
-        """移动非层参数到GPU"""
+        """指针式搬运非层参数到 GPU"""
         layer_tensor_ids = set()
         for layer in self._layers:
             for t in itertools.chain(layer.parameters(), layer.buffers()):
                 layer_tensor_ids.add(id(t))
 
+        def _ensure(param: torch.Tensor) -> None:
+            pid = id(param)
+            if pid not in self._non_layer_cpu_refs:
+                self._non_layer_cpu_refs[pid] = param.data  # 保存权威 CPU 引用
+            # 若已在目标设备，.to() 同设备返回自身（不复制/不新建）
+            param.data = self._non_layer_cpu_refs[pid].to(self._target_device)
+
         for p in self._model.parameters():
             if id(p) not in layer_tensor_ids:
-                p.data = p.data.to(self._target_device)
+                _ensure(p)
         for b in self._model.buffers():
             if id(b) not in layer_tensor_ids:
-                b.data = b.data.to(self._target_device)
+                _ensure(b)
     
     def _register_simple_hooks(self) -> None:
-        """注册简单的加载/释放钩子"""
+        """注册简单的加载/释放钩子（仅非常驻层）"""
         idx_map = {id(layer): idx for idx, layer in enumerate(self._layers)}
         
         def _pre_hook(module: nn.Module, input, *, idx: int):
@@ -272,14 +349,46 @@ class SimpleLayerStreamingWrapper(nn.Module):
                 param.data.record_stream(torch.cuda.current_stream(self._target_device))
         
         def _post_hook(module: nn.Module, input, output, *, idx: int):
-            # 处理完后立即将层移回CPU
+            # 等待该层在 GPU 上的计算真正完成，再卸载回 CPU
+            event = getattr(self, "_events", {}).get(idx)
+            if event is not None:
+                event.record(torch.cuda.current_stream(self._target_device))
+                event.synchronize()
+            # 处理完后立即将层移回CPU（零拷贝指回 CPU 引用）
             self._store.unload_layer_from_gpu(idx, module)
+            # 强制清空 CUDA 缓存分配器中的空闲块，防止异步计算与快速卸载
+            # 导致大量已释放显存被缓存，从而在 nvidia-smi 中显示偏高
+            torch.cuda.empty_cache()
         
         for layer in self._layers:
             idx = idx_map[id(layer)]
+            if idx in self._resident:
+                continue  # 常驻层不注册卸载钩子
             pre_hook = layer.register_forward_pre_hook(functools.partial(_pre_hook, idx=idx))
             post_hook = layer.register_forward_hook(functools.partial(_post_hook, idx=idx))
     
+    def to(self, *args: Any, **kwargs: Any) -> "SimpleLayerStreamingWrapper":
+        """覆盖 nn.Module.to，走指针式搬运而非反复 .to() 新建。
+
+        - to("cpu")：仅将非常驻层指回 CPU 引用以释放其 GPU 张量；
+          非层参数保持 GPU 常驻（不卸载），以便下一轮推理复用同一 GPU 张量，
+          从根本上避免 CUDA 分配器碎片累积。
+        - 其他（如 to(cuda)）：确保非层参数在 GPU（指针式复用）。
+        """
+        target = None
+        if args:
+            a = args[0]
+            if isinstance(a, (str, torch.device)):
+                target = torch.device(a)
+        if target is not None and target.type == "cpu":
+            for idx in range(len(self._layers)):
+                if not self._store.is_resident(idx):
+                    self._store.unload_layer_from_gpu(idx, self._layers[idx])
+            # 非层参数保持 GPU 常驻，不卸载
+        else:
+            self._move_non_layer_params_to_gpu()
+        return self
+
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self._model(*args, **kwargs)
     
@@ -292,287 +401,5 @@ class SimpleLayerStreamingWrapper(nn.Module):
             # 如果失败，则从原始模型获取
             return getattr(self._model, name)
     
-def _register_simple_hooks(self) -> None:
-    """注册简单的加载/释放钩子"""
-    idx_map = {id(layer): idx for idx, layer in enumerate(self._layers)}
-    
-    def _pre_hook(module: nn.Module, input, *, idx: int):
-        # 加载当前层到GPU
-        self._store.load_layer_to_gpu(idx, module)
-        # 记录流，防止内存被提前回收
-        for param in itertools.chain(module.parameters(), module.buffers()):
-            param.data.record_stream(torch.cuda.current_stream(self._target_device))
-    
-    def _post_hook(module: nn.Module, input, output, *, idx: int):
-        # 处理完后立即将层移回CPU
-        self._store.unload_layer_from_gpu(idx, module)
-    
-    for layer in self._layers:
-        idx = idx_map[id(layer)]
-        pre_hook = layer.register_forward_pre_hook(functools.partial(_pre_hook, idx=idx))
-        post_hook = layer.register_forward_hook(functools.partial(_post_hook, idx=idx))
 
 
-class _LayerStore:
-    """Manages CPU-pinned copies of layer parameters/buffers.
-    Tracks which layers currently reside on GPU so the prefetcher and evictor
-    can make correct decisions.
-    """
-
-    def __init__(self, layers: nn.ModuleList, target_device: torch.device) -> None:
-        self.target_device = target_device
-        self.num_layers = len(layers)
-
-        # CPU-pinned copies keyed by (layer_idx, param_name)
-        self._pinned: list[dict[str, torch.Tensor]] = []
-        self._on_gpu: set[int] = set()
-
-        for layer in layers:
-            pinned: dict[str, torch.Tensor] = {}
-            for name, tensor in itertools.chain(layer.named_parameters(), layer.named_buffers()):
-                pinned_tensor = tensor.data.pin_memory()
-                tensor.data = pinned_tensor
-                pinned[name] = pinned_tensor
-            self._pinned.append(pinned)
-
-    def _check_idx(self, idx: int) -> None:
-        if idx < 0 or idx >= self.num_layers:
-            raise IndexError(f"Layer index {idx} out of range [0, {self.num_layers})")
-
-    def is_on_gpu(self, idx: int) -> bool:
-        return idx in self._on_gpu
-
-    def move_to_gpu(self, idx: int, layer: nn.Module, *, non_blocking: bool = False) -> None:
-        """Move layer *idx* parameters from pinned CPU to *target_device*."""
-        self._check_idx(idx)
-        if idx in self._on_gpu:
-            return
-        pinned = self._pinned[idx]
-        for name, param in itertools.chain(layer.named_parameters(), layer.named_buffers()):
-            param.data = pinned[name].to(self.target_device, non_blocking=non_blocking)
-        self._on_gpu.add(idx)
-
-    def evict_to_cpu(self, idx: int, layer: nn.Module) -> None:
-        """Swap layer *idx* parameters back to their pinned CPU copies."""
-        self._check_idx(idx)
-        if idx not in self._on_gpu:
-            return
-        pinned = self._pinned[idx]
-        for name, param in itertools.chain(layer.named_parameters(), layer.named_buffers()):
-            param.data = pinned[name]
-        self._on_gpu.discard(idx)
-
-    def cleanup(self) -> None:
-        """Release all pinned memory references.
-        After this call, the pinned tensors can be garbage-collected once
-        the layer parameters (which still reference them via ``.data``) are
-        also released (e.g. via ``.to("meta")``).
-        """
-        for pinned_dict in self._pinned:
-            pinned_dict.clear()
-        self._pinned.clear()
-
-
-class _AsyncPrefetcher:
-    """Issues H2D transfers on a dedicated CUDA stream.
-    Uses per-layer CUDA events so that the compute stream only waits for the
-    specific layer it needs, not all pending transfers.
-    """
-
-    def __init__(self, store: _LayerStore, layers: nn.ModuleList) -> None:
-        self._store = store
-        self._layers = layers
-        self._stream = torch.cuda.Stream(device=store.target_device)
-        self._events: dict[int, torch.cuda.Event] = {}
-
-    def prefetch(self, idx: int) -> None:
-        """Begin async transfer of layer *idx* to GPU (no-op if already there)."""
-        if self._store.is_on_gpu(idx) or idx in self._events:
-            return
-        with torch.cuda.stream(self._stream):
-            self._store.move_to_gpu(idx, self._layers[idx], non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(self._stream)
-            self._events[idx] = event
-
-    def wait(self, idx: int) -> None:
-        """Block the compute stream until layer *idx* transfer is complete."""
-        event = self._events.pop(idx, None)
-        if event is not None:
-            torch.cuda.current_stream(self._store.target_device).wait_event(event)
-
-    def cleanup(self) -> None:
-        """Drain pending work and release CUDA stream/event resources."""
-        self._events.clear()
-        self._stream = None
-        self._layers = None
-        self._store = None
-
-
-class LayerStreamingWrapper(nn.Module):
-    """Wraps a model to stream its sequential layers between CPU and GPU.
-    Each layer is evicted immediately after its forward completes, and
-    prefetch wraps around using modular indexing so the end of one forward
-    pass prepares early layers for the next.
-    Parameters
-    ----------
-    model:
-        The model to wrap, with all parameters on **CPU**.
-    layers_attr:
-        Dotted attribute path to the ``nn.ModuleList`` of sequential layers
-        (e.g. ``"transformer_blocks"`` or ``"model.language_model.layers"``).
-    target_device:
-        The GPU device to use for compute.
-    prefetch_count:
-        How many layers ahead to prefetch.  The maximum number of layers on
-        GPU at once is ``1 + prefetch_count``.  Must be >= 1.
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        layers_attr: str,
-        target_device: torch.device,
-        prefetch_count: int = 2,
-    ) -> None:
-        if prefetch_count < 1:
-            raise ValueError("prefetch_count must be >= 1")
-        super().__init__()
-        # Store the wrapped model as a submodule so parameters are discoverable.
-        self._model = model
-        self._layers = _resolve_attr(model, layers_attr)
-        self._target_device = target_device
-        # Clamp: no point prefetching more than num_layers - 1 (the rest are evicted).
-        self._prefetch_count = min(prefetch_count, len(self._layers) - 1)
-        self._hooks: list[torch.utils.hooks.RemovableHandle] = []
-
-        self._setup()
-
-    # ------------------------------------------------------------------
-    # Setup / teardown
-    # ------------------------------------------------------------------
-
-
-    def _setup(self) -> None:
-        # 1. Build the pinned CPU store (copies all layer tensors to pinned memory).
-        self._store = _LayerStore(self._layers, self._target_device)
-
-        # 2. Move all NON-layer params/buffers to GPU.
-        layer_tensor_ids: set[int] = set()
-        for layer in self._layers:
-            for t in itertools.chain(layer.parameters(), layer.buffers()):
-                layer_tensor_ids.add(id(t))
-
-        for p in self._model.parameters():
-            if id(p) not in layer_tensor_ids:
-                p.data = p.data.to(self._target_device)
-        for b in self._model.buffers():
-            if id(b) not in layer_tensor_ids:
-                b.data = b.data.to(self._target_device)
-
-        # 3. Pre-load the first (1 + prefetch_count) layers synchronously.
-        for idx in range(min(self._prefetch_count + 1, len(self._layers))):
-            self._store.move_to_gpu(idx, self._layers[idx])
-
-        # 4. Create the async prefetcher and register hooks.
-        self._prefetcher = _AsyncPrefetcher(self._store, self._layers)
-        self._register_hooks()
-
-
-    def _register_hooks(self) -> None:
-        idx_map: dict[int, int] = {id(layer): idx for idx, layer in enumerate(self._layers)}
-        num_layers = len(self._layers)
-
-        def _pre_hook(
-            module: nn.Module,
-            _args: Any,  # noqa: ANN401
-            *,
-            idx: int,
-        ) -> None:
-            # Wait only for THIS layer's H2D transfer (not all pending ones).
-            self._prefetcher.wait(idx)
-            if not self._store.is_on_gpu(idx):
-                self._store.move_to_gpu(idx, module)
-
-            # Record that the compute stream will read these weight tensors.
-            # They were allocated on the prefetch stream, so without this the
-            # caching allocator would allow the prefetch stream to reuse their
-            # memory immediately after eviction — even if the compute kernel
-            # that reads them hasn't finished yet.
-            compute_stream = torch.cuda.current_stream(self._target_device)
-            for param in itertools.chain(module.parameters(), module.buffers()):
-                param.data.record_stream(compute_stream)
-
-            # Kick off prefetch for upcoming layers (wraps around for next pass).
-            for offset in range(1, self._prefetch_count + 1):
-                self._prefetcher.prefetch((idx + offset) % num_layers)
-
-        def _post_hook(
-            module: nn.Module,
-            _args: Any,  # noqa: ANN401
-            _output: Any,  # noqa: ANN401
-            *,
-            idx: int,
-        ) -> None:
-            # Evict this layer immediately — its computation is done.
-            self._store.evict_to_cpu(idx, module)
-
-        for layer in self._layers:
-            idx = idx_map[id(layer)]
-            h1 = layer.register_forward_pre_hook(functools.partial(_pre_hook, idx=idx))
-            h2 = layer.register_forward_hook(functools.partial(_post_hook, idx=idx))
-            self._hooks.extend([h1, h2])
-
-    def teardown(self) -> None:
-        """Remove hooks, release pinned memory, and move parameters back to CPU.
-        After this call the wrapper is inert: hooks are removed, the prefetch
-        stream is drained and destroyed, all parameters reside on regular
-        (non-pinned) CPU memory, and the ``_LayerStore`` pinned-tensor cache is
-        cleared.  Callers should still follow up with ``.to("meta")`` to release
-        the CPU copies if the model is no longer needed.
-        """
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
-
-        # Drain all in-flight async H2D copies, then release stream resources.
-        # Without the synchronize, clearing the stream/events can trigger
-        # use-after-free at the CUDA driver level.
-        torch.cuda.synchronize(device=self._target_device)
-        if self._prefetcher is not None:
-            self._prefetcher.cleanup()
-            self._prefetcher = None
-
-        # Move everything to CPU.
-        for idx, layer in enumerate(self._layers):
-            self._store.evict_to_cpu(idx, layer)
-
-        for p in self._model.parameters():
-            p.data = p.data.to("cpu")
-        for b in self._model.buffers():
-            b.data = b.data.to("cpu")
-
-        # Release pinned memory.  After evict_to_cpu() the layer parameters
-        # still reference the pinned tensors (since .to("cpu") on a pinned
-        # tensor is a no-op).  The caller is expected to follow up with
-        # .to("meta") to drop the param refs; cleanup() drops the store's refs.
-        self._store.cleanup()
-
-    # ------------------------------------------------------------------
-    # Forward and attribute delegation
-    # ------------------------------------------------------------------
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
-        return self._model(*args, **kwargs)
-
-    def __getattr__(self, name: str) -> Any:  # noqa: ANN401
-        """Proxy attribute access to the wrapped model.
-        This allows calling methods like ``encode()`` on a wrapped
-        GemmaTextEncoder without the caller needing to know about the wrapper.
-        ``nn.Module.__getattr__`` is only called when normal attribute lookup
-        fails, so ``_model``, ``_store``, etc. are found first via ``__dict__``.
-        """
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self._model, name)
