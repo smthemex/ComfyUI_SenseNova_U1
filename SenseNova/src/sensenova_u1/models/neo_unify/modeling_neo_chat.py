@@ -910,6 +910,7 @@ class NEOChatModel(PreTrainedModel):
                             norm_v_cfg = torch.norm(v_pred, dim=-1, keepdim=True)
                             scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
                             v_pred = v_pred * scale
+                        del out_cond, out_img_cond, out_uncond
 
                     z = z + (t_next - t) * v_pred
                     image_prediction = self.unpatchify(z, self.patch_size * merge_size, cur_image_size[1], cur_image_size[0])
@@ -1234,6 +1235,7 @@ class NEOChatModel(PreTrainedModel):
                             norm_v_cfg = torch.norm(v_pred, dim=-1, keepdim=True)
                             scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
                             v_pred = v_pred * scale
+                        del out_cond, out_img_cond, out_uncond
 
                     z = z + (t_next - t) * v_pred
                     image_prediction = self.unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
@@ -1308,9 +1310,41 @@ class NEOChatModel(PreTrainedModel):
                         use_cache=True
                     )
                     return outputs, t_idx + 2
+                def _append_image_to_cache(self, cache, t_idx, inputs_embeds_img, N_img_tokens, abs_pos_w, abs_pos_h):
+                    past_len = cache.get_seq_length()
+                    tgt_len = N_img_tokens + 1
+                    
+                    t_indexes = torch.zeros(tgt_len, dtype=torch.long, device=self.device)
+                    t_indexes[:N_img_tokens] = t_idx + 1
+                    t_indexes[N_img_tokens] = t_idx + 2
+                    
+                    h_indexes = torch.zeros(tgt_len, dtype=torch.long, device=self.device)
+                    w_indexes = torch.zeros(tgt_len, dtype=torch.long, device=self.device)
+                    h_indexes[:N_img_tokens] = abs_pos_h
+                    w_indexes[:N_img_tokens] = abs_pos_w
+                    
+                    indexes = torch.stack([t_indexes, h_indexes, w_indexes], dim=0)
+                    
+                    mask = torch.zeros(1, 1, tgt_len, past_len + tgt_len, device=self.device)
+                    mask[0, 0, :N_img_tokens, past_len + N_img_tokens] = float('-inf')
+                    attention_mask_dict = {"full_attention": mask}
+                    
+                    outputs = self.language_model(
+                        inputs_embeds=inputs_embeds_img,
+                        indexes=indexes,
+                        attention_mask=attention_mask_dict,
+                        past_key_values=cache,
+                        use_cache=True
+                    )
+                    return outputs, t_idx + 2
 
-                outputs_cond, t_index_cond = append_image_to_cache(past_key_values_cond, t_index_cond)
-                outputs_tu, t_index_tu = append_image_to_cache(past_key_values_tu, t_index_tu)
+
+                # 在 interleave_gen 函数中替换原闭包调用
+                outputs_cond, t_index_cond = self._append_image_to_cache(past_key_values_cond, t_index_cond, inputs_embeds_img, N_img_tokens, abs_pos_w, abs_pos_h)
+                outputs_tu, t_index_tu = self._append_image_to_cache(past_key_values_tu, t_index_tu, inputs_embeds_img, N_img_tokens, abs_pos_w, abs_pos_h)
+                
+                # outputs_cond, t_index_cond = append_image_to_cache(past_key_values_cond, t_index_cond)
+                # outputs_tu, t_index_tu = append_image_to_cache(past_key_values_tu, t_index_tu)
 
                 del vit_embeds, inputs_embeds_img, abs_pos_w, abs_pos_h, flatten_pixel_values
                 del und_img, raw_img, pred_img, gen_grid_hw
@@ -1325,51 +1359,113 @@ class NEOChatModel(PreTrainedModel):
 
     @torch.no_grad()
     def it2i_generate(self, tokenizer, prompt, images, cfg_scale=1, img_cfg_scale=1, cfg_norm='none', enable_timestep_shift=True, timestep_shift=1, image_size=(256, 256), num_steps=30, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', method='euler', cfg_interval=(0, 1), batch_size=1, t_eps=0.02, think_mode=False, seed=0):
+        self.last_think_content = "" # 重置 last_think_content 防止累积
         assert cfg_norm in ['none', 'global', 'channel']
 
         self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.config.t_eps = t_eps
 
-        image_token_count = prompt.count('<image>')
-        assert len(images) >= image_token_count
-        if len(images) > image_token_count:
-            if image_token_count == 0 and len(images) > 1:
-                prompt = "".join(f"Image-{i + 1}:<image>\n" for i in range(len(images))) + prompt
+        image_tag=False
+        if prompt.count('<image1>'):
+            image_tag=True
+            import re  
+            # 1. 提取所有 <imageN> 中的数字索引
+            img_indices = [int(x) for x in re.findall(r'<image(\d+)>', prompt)]
+            max_img_idx = max(img_indices) if img_indices else 0
+            
+            # 2. 校验传入的图像数量是否足够
+            assert len(images) >= max_img_idx, f"需要 {max_img_idx} 张图，但只提供了 {len(images)} 张"
+            
+            # 3. 根据文本中的索引顺序对图像重排 (索引从1开始)
+            if img_indices:
+                ordered_images = [images[idx - 1] for idx in img_indices]
             else:
-                prompt = "<image>\n" * (len(images) - image_token_count) + prompt
+                ordered_images = []
+                
+            # 4. 处理未被引用的多余图像：自动在句首补齐 <imageN>
+            unreferenced_count = len(images) - max_img_idx
+            if unreferenced_count > 0:
+                prepend_str = "".join(f"<image{max_img_idx + i + 1}>\n" for i in range(unreferenced_count))
+                prompt = prepend_str + prompt
+                ordered_images.extend(images[max_img_idx:])
+                
+            # 5. 统一将 <imageN> 转换为模型底层的 <image>，以便后续走原生替换流程
+            prompt = re.sub(r'<image\d+>', '<image>', prompt)
+            pixel_values = []
+            grid_hw = []
+            # 1. 遍历重排后的 ordered_images，保证特征提取顺序与 prompt 中 <imageN> 的出现顺序一致
+            for image in ordered_images:
+                cur_pixel_values, cur_grid_hw = load_image_native(
+                    image,
+                    self.patch_size,
+                    self.downsample_ratio,
+                    min_pixels=512 * 512,
+                    max_pixels=min(2048*2048, (4096 * 4096) // len(ordered_images)),
+                    upscale=False,
+                )
+                cur_grid_hw = cur_grid_hw.to(self.device)
+                cur_pixel_values = cur_pixel_values.to(self.device).to(torch.bfloat16)
+                pixel_values.append(cur_pixel_values)
+                grid_hw.append(cur_grid_hw)
+            pixel_values = torch.cat(pixel_values)
+            grid_hw = torch.cat(grid_hw)
 
-        pixel_values = []
-        grid_hw = []
-        for image in images:
-            cur_pixel_values, cur_grid_hw = load_image_native(
-                image,
-                self.patch_size,
-                self.downsample_ratio,
-                min_pixels=512 * 512,
-                max_pixels=min(2048*2048, (4096 * 4096) // len(images)),
-                upscale=False,
+            merge_size = int(1 / self.downsample_ratio)
+            question_condition = f"{prompt}"
+            think_text = ""
+            needs_cfg = not (cfg_scale == 1 and img_cfg_scale == 1)
+            needs_img_condition = needs_cfg and (img_cfg_scale == 1 or cfg_scale != img_cfg_scale)
+            needs_uncondition = needs_cfg and img_cfg_scale != 1
+
+            think_content = '</think>\n' if think_mode else '</think>\n\n' + IMG_START_TOKEN
+            query_condition = self._build_t2i_query(question_condition, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
+            query_img_condition = (
+                # 2. 此处也必须使用 ordered_images 的长度，保证 CFG 分支的图像数量与 Condition 分支一致
+                self._build_t2i_query('<image>' * len(ordered_images), append_text=IMG_START_TOKEN)
+                if needs_img_condition
+                else None
             )
-            cur_grid_hw = cur_grid_hw.to(self.device)
-            cur_pixel_values = cur_pixel_values.to(self.device).to(torch.bfloat16)
-            pixel_values.append(cur_pixel_values)
-            grid_hw.append(cur_grid_hw)
-        pixel_values = torch.cat(pixel_values)
-        grid_hw = torch.cat(grid_hw)
+        else:        
+            image_token_count = prompt.count('<image>')
+            assert len(images) >= image_token_count
+            if len(images) > image_token_count:
+                if image_token_count == 0 and len(images) > 1:
+                    prompt = "".join(f"Image-{i + 1}:<image>\n" for i in range(len(images))) + prompt
+                else:
+                    prompt = "<image>\n" * (len(images) - image_token_count) + prompt
 
-        merge_size = int(1 / self.downsample_ratio)
-        question_condition = f"{prompt}"
-        
-        think_text = ""
-        needs_cfg = not (cfg_scale == 1 and img_cfg_scale == 1)
-        needs_img_condition = needs_cfg and (img_cfg_scale == 1 or cfg_scale != img_cfg_scale)
-        needs_uncondition = needs_cfg and img_cfg_scale != 1
-        think_content = '<think>\n' if think_mode else '<think>\n\n</think>\n\n' + IMG_START_TOKEN
-        query_condition = self._build_t2i_query(question_condition, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
-        query_img_condition = (
-            self._build_t2i_query('<image>' * len(images), append_text=IMG_START_TOKEN)
-            if needs_img_condition
-            else None
-        )
+            pixel_values = []
+            grid_hw = []
+            for image in images:
+                cur_pixel_values, cur_grid_hw = load_image_native(
+                    image,
+                    self.patch_size,
+                    self.downsample_ratio,
+                    min_pixels=512 * 512,
+                    max_pixels=min(2048*2048, (4096 * 4096) // len(images)),
+                    upscale=False,
+                )
+                cur_grid_hw = cur_grid_hw.to(self.device)
+                cur_pixel_values = cur_pixel_values.to(self.device).to(torch.bfloat16)
+                pixel_values.append(cur_pixel_values)
+                grid_hw.append(cur_grid_hw)
+            pixel_values = torch.cat(pixel_values)
+            grid_hw = torch.cat(grid_hw)
+
+            merge_size = int(1 / self.downsample_ratio)
+            question_condition = f"{prompt}"
+            think_text = ""
+            needs_cfg = not (cfg_scale == 1 and img_cfg_scale == 1)
+            needs_img_condition = needs_cfg and (img_cfg_scale == 1 or cfg_scale != img_cfg_scale)
+            needs_uncondition = needs_cfg and img_cfg_scale != 1
+
+            think_content = '<think>\n' if think_mode else '<think>\n\n</think>\n\n' + IMG_START_TOKEN
+            query_condition = self._build_t2i_query(question_condition, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
+            query_img_condition = (
+                self._build_t2i_query('<image>' * len(images), append_text=IMG_START_TOKEN)
+                if needs_img_condition
+                else None
+            )
         query_uncondition = self._build_t2i_query("", append_text=IMG_START_TOKEN) if needs_uncondition else None
 
         for i in range(grid_hw.shape[0]):
@@ -1381,6 +1477,7 @@ class NEOChatModel(PreTrainedModel):
         input_embeds_condition, indexes_condition, attention_mask_condition_prefix = self._build_it2i_inputs(
             tokenizer, query_condition, pixel_values, grid_hw
         )
+
         if query_img_condition is not None:
             input_embeds_img_condition, indexes_img_condition, attention_mask_img_condition_prefix = self._build_it2i_inputs(
                 tokenizer, query_img_condition, pixel_values, grid_hw
@@ -1527,126 +1624,135 @@ class NEOChatModel(PreTrainedModel):
         timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
         if enable_timestep_shift:
             timesteps = self._apply_time_schedule(timesteps, token_h * token_w, timestep_shift)
+        try:
+            for step_i in tqdm(range(num_steps), desc="it2i_generate", leave=False):
+                t = timesteps[step_i]
+                t_next = timesteps[step_i + 1]
+                use_cfg = (t > cfg_interval[0] and t < cfg_interval[1]) or cfg_interval[0] == 0
 
-        for step_i in tqdm(range(num_steps), desc="it2i_generate", leave=False):
-            t = timesteps[step_i]
-            t_next = timesteps[step_i + 1]
-            use_cfg = (t > cfg_interval[0] and t < cfg_interval[1]) or cfg_interval[0] == 0
+                z = self.patchify(image_prediction, self.patch_size * merge_size)
+                image_input = self.patchify(image_prediction, self.patch_size, channel_first=True)
+                image_embeds = self.extract_feature(
+                    image_input.view(batch_size * grid_h * grid_w, -1),
+                    gen_model=True,
+                    grid_hw=grid_hw,
+                ).view(batch_size, token_h * token_w, -1)
+                t_expanded = t.expand(batch_size * token_h * token_w)
+                timestep_embeddings = self.fm_modules['timestep_embedder'](t_expanded).view(batch_size, token_h * token_w, -1)
+                if self.add_noise_scale_embedding:
+                    noise_scale_tensor = torch.full_like(t_expanded, noise_scale / self.noise_scale_max_value)
+                    noise_embeddings = self.fm_modules['noise_scale_embedder'](noise_scale_tensor).view(batch_size, token_h * token_w, -1)
+                    timestep_embeddings += noise_embeddings
+                image_embeds = image_embeds + timestep_embeddings
 
-            z = self.patchify(image_prediction, self.patch_size * merge_size)
-            image_input = self.patchify(image_prediction, self.patch_size, channel_first=True)
-            image_embeds = self.extract_feature(
-                image_input.view(batch_size * grid_h * grid_w, -1),
-                gen_model=True,
-                grid_hw=grid_hw,
-            ).view(batch_size, token_h * token_w, -1)
-            t_expanded = t.expand(batch_size * token_h * token_w)
-            timestep_embeddings = self.fm_modules['timestep_embedder'](t_expanded).view(batch_size, token_h * token_w, -1)
-            if self.add_noise_scale_embedding:
-                noise_scale_tensor = torch.full_like(t_expanded, noise_scale / self.noise_scale_max_value)
-                noise_embeddings = self.fm_modules['noise_scale_embedder'](noise_scale_tensor).view(batch_size, token_h * token_w, -1)
-                timestep_embeddings += noise_embeddings
-            image_embeds = image_embeds + timestep_embeddings
-
-            out_cond = self._t2i_predict_v(
-                image_embeds,
-                indexes_image_condition,
-                attention_mask_condition,
-                past_key_values_condition,
-                t,
-                z,
-                image_token_num=token_h * token_w,
-                timestep_embeddings=timestep_embeddings,
-                image_size=image_size,
-            )
-
-            if not use_cfg:
-                v_pred = out_cond
-            elif cfg_scale == 1 and img_cfg_scale == 1:
-                v_pred = out_cond
-            elif img_cfg_scale == 1:
-                out_img_cond = self._t2i_predict_v(
+                out_cond = self._t2i_predict_v(
                     image_embeds,
-                    indexes_image_img_condition,
-                    attention_mask_img_condition,
-                    past_key_values_img_condition,
+                    indexes_image_condition,
+                    attention_mask_condition,
+                    past_key_values_condition,
                     t,
                     z,
                     image_token_num=token_h * token_w,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
                 )
-                v_pred = out_img_cond + cfg_scale * (out_cond - out_img_cond)
-            elif cfg_scale == img_cfg_scale:
-                out_uncond = self._t2i_predict_v(
-                    image_embeds,
-                    indexes_image_uncondition,
-                    attention_mask_uncondition,
-                    past_key_values_uncondition,
-                    t,
-                    z,
-                    image_token_num=token_h * token_w,
-                    timestep_embeddings=timestep_embeddings,
-                    image_size=image_size,
-                )
-                v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
-            else:
-                out_img_cond = self._t2i_predict_v(
-                    image_embeds,
-                    indexes_image_img_condition,
-                    attention_mask_img_condition,
-                    past_key_values_img_condition,
-                    t,
-                    z,
-                    image_token_num=token_h * token_w,
-                    timestep_embeddings=timestep_embeddings,
-                    image_size=image_size,
-                )
-                out_uncond = self._t2i_predict_v(
-                    image_embeds,
-                    indexes_image_uncondition,
-                    attention_mask_uncondition,
-                    past_key_values_uncondition,
-                    t,
-                    z,
-                    image_token_num=token_h * token_w,
-                    timestep_embeddings=timestep_embeddings,
-                    image_size=image_size,
-                )
-                v_pred = (
-                    out_uncond
-                    + cfg_scale * (out_cond - out_img_cond)
-                    + img_cfg_scale * (out_img_cond - out_uncond)
-                )
-            if (cfg_scale > 1 or img_cfg_scale > 1) and use_cfg:
-                if cfg_norm == 'global':
-                    norm_v_condition = torch.norm(out_cond, dim=(1, 2), keepdim=True)
-                    norm_v_cfg = torch.norm(v_pred, dim=(1, 2), keepdim=True)
-                    scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
-                    v_pred = v_pred * scale
-                elif cfg_norm == 'channel':
-                    norm_v_condition = torch.norm(out_cond, dim=-1, keepdim=True)
-                    norm_v_cfg = torch.norm(v_pred, dim=-1, keepdim=True)
-                    scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
-                    v_pred = v_pred * scale
 
-            z = z + (t_next - t) * v_pred
-            image_prediction = self.unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
+                if not use_cfg:
+                    v_pred = out_cond
+                elif cfg_scale == 1 and img_cfg_scale == 1:
+                    v_pred = out_cond
+                elif img_cfg_scale == 1:
+                    out_img_cond = self._t2i_predict_v(
+                        image_embeds,
+                        indexes_image_img_condition,
+                        attention_mask_img_condition,
+                        past_key_values_img_condition,
+                        t,
+                        z,
+                        image_token_num=token_h * token_w,
+                        timestep_embeddings=timestep_embeddings,
+                        image_size=image_size,
+                    )
+                    v_pred = out_img_cond + cfg_scale * (out_cond - out_img_cond)
+                elif cfg_scale == img_cfg_scale:
+                    out_uncond = self._t2i_predict_v(
+                        image_embeds,
+                        indexes_image_uncondition,
+                        attention_mask_uncondition,
+                        past_key_values_uncondition,
+                        t,
+                        z,
+                        image_token_num=token_h * token_w,
+                        timestep_embeddings=timestep_embeddings,
+                        image_size=image_size,
+                    )
+                    v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
+                else:
+                    out_img_cond = self._t2i_predict_v(
+                        image_embeds,
+                        indexes_image_img_condition,
+                        attention_mask_img_condition,
+                        past_key_values_img_condition,
+                        t,
+                        z,
+                        image_token_num=token_h * token_w,
+                        timestep_embeddings=timestep_embeddings,
+                        image_size=image_size,
+                    )
+                    out_uncond = self._t2i_predict_v(
+                        image_embeds,
+                        indexes_image_uncondition,
+                        attention_mask_uncondition,
+                        past_key_values_uncondition,
+                        t,
+                        z,
+                        image_token_num=token_h * token_w,
+                        timestep_embeddings=timestep_embeddings,
+                        image_size=image_size,
+                    )
+                    v_pred = (
+                        out_uncond
+                        + cfg_scale * (out_cond - out_img_cond)
+                        + img_cfg_scale * (out_img_cond - out_uncond)
+                    )
+                if (cfg_scale > 1 or img_cfg_scale > 1) and use_cfg:
+                    if cfg_norm == 'global':
+                        norm_v_condition = torch.norm(out_cond, dim=(1, 2), keepdim=True)
+                        norm_v_cfg = torch.norm(v_pred, dim=(1, 2), keepdim=True)
+                        scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
+                        v_pred = v_pred * scale
+                    elif cfg_norm == 'channel':
+                        norm_v_condition = torch.norm(out_cond, dim=-1, keepdim=True)
+                        norm_v_cfg = torch.norm(v_pred, dim=-1, keepdim=True)
+                        scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
+                        v_pred = v_pred * scale
+                    del out_cond, out_img_cond, out_uncond
 
-        clear_flash_kv_cache(past_key_values_condition)
-        if past_key_values_img_condition is not None:
-            clear_flash_kv_cache(past_key_values_img_condition)
-        if past_key_values_uncondition is not None:
-            clear_flash_kv_cache(past_key_values_uncondition)
+                z = z + (t_next - t) * v_pred
+                image_prediction = self.unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
 
+            clear_flash_kv_cache(past_key_values_condition)
+            if past_key_values_img_condition is not None:
+                clear_flash_kv_cache(past_key_values_img_condition)
+            if past_key_values_uncondition is not None:
+                clear_flash_kv_cache(past_key_values_uncondition)
 
-        self.last_think_content = think_text
-        if think_mode:
-            return image_prediction, think_text
-        return image_prediction
+            self.last_think_content = think_text
+            if think_mode:
+                return image_prediction, think_text
+            return image_prediction
+        finally:
+            # 确保清理所有 KV Cache
+            clear_flash_kv_cache(past_key_values_condition)
+            if past_key_values_img_condition is not None:
+                clear_flash_kv_cache(past_key_values_img_condition)
+            if past_key_values_uncondition is not None:
+                clear_flash_kv_cache(past_key_values_uncondition)
+            torch.cuda.empty_cache()
 
     @torch.no_grad()
     def t2i_generate(self, tokenizer, prompt, cfg_scale=1, timestep_shift=1, enable_timestep_shift=True, cfg_norm='none', image_size=(256, 256), num_steps=30, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', method='euler', cfg_interval=(0, 1), batch_size=1, t_eps=0.02, think_mode=False, seed=0):
+        self.last_think_content = "" # 重置 last_think_content 防止累积
         assert self.concat_time_token_num == 0
         assert cfg_norm in ['cfg_zero_star', 'global', 'none', 'channel']
         merge_size = int(1 / self.downsample_ratio)
