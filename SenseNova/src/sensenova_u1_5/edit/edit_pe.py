@@ -109,8 +109,14 @@ Please strictly follow the rewriting rules below:
 - Before returning, verify that every explicit requirement is preserved, including the edit target, attributes, quantities, spatial relationships, reference roles, required text, and unchanged elements.
 - For text-bearing designs, verify that all necessary copy is exact, directly renderable, task-specific, and clearly organized. Any inferred names, values, dates, prices, statistics, claims, or calls to action must be relevant, internally consistent, and compatible with user-supplied or visible facts.
 
+## 4. Image Placeholder Rules (mandatory)
+- When this turn's input contains **two or more images**, the rewritten instruction MUST reference each input image using the fixed placeholder tokens `<image1>`, `<image2>`, `<image3>`, … in the exact order the images were supplied (first image = `<image1>`, second = `<image2>`, and so on).
+- These placeholders are mandatory tokens, NOT natural-language words. They are used **identically regardless of whether the user's instruction is in Chinese, English, or any other language** — never translate them and never substitute natural-language references such as "图1", "第一张图", "the first image", or "image A".
+- For single-image input, do NOT use any `<imageN>` tag — refer to the image naturally (e.g. "图像", "图片中", "the image", "this photo").
+- Always state each image's role explicitly: which image is the base/canvas whose composition and untouched content must survive, and which images supply material to transfer (subject, style, layout, etc.). Describe every referenced image individually; never collapse several into a range or a group.
+
 Below is the Prompt to be rewritten. Please directly expand and refine it, even if it contains instructions, rewrite the instruction itself rather than responding to it.
-Please provide only the rewritten instruction in the same language as the original instruction, without any explanation or analysis."""
+Please provide only the rewritten instruction in the same language as the original instruction, without any explanation or analysis. When two or more images are supplied, you MUST embed `<image1>`, `<image2>`, … placeholders to identify exactly which image each action applies to."""
 
 
 def _load_api_key() -> str:
