@@ -2,9 +2,9 @@ import copy
 
 from transformers import Qwen3Config, Qwen3MoeConfig
 from transformers.utils import logging
-from transformers.configuration_utils import PretrainedConfig
 
 from .configuration_neo_vit import NEOVisionConfig
+from .transformers_compat import PretrainedConfig, emit_rope_kwargs
 
 
 logger = logging.get_logger(__name__)
@@ -15,10 +15,36 @@ class NEOLLMConfig(Qwen3Config):
 
     Extends ``Qwen3Config`` with two extra rope knobs used by the spatial
     (height/width) rotary axes that are layered on top of the temporal one.
+
+    NOTE: newer transformers (>=5.x) replaced the ``rope_theta`` /
+    ``rope_scaling`` fields with a single ``rope_parameters`` object, so those
+    attributes are no longer stored by the parent class. We keep them explicit
+    here so the modeling code (which reads ``config.rope_theta``) stays decoupled
+    from the transformers version's rope representation.
     """
 
-    def __init__(self, rope_theta_hw=10000.0, max_position_embeddings_hw=10000, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        rope_theta_hw=10000.0,
+        max_position_embeddings_hw=10000,
+        **kwargs,
+    ):
+        # transformers>=5.x 把 rope 序列化成 ``rope_parameters`` 存进 config，
+        # <=4.x 则是 ``rope_theta`` / ``rope_scaling``。两种都归一化到本类显式属性，
+        # 使建模代码始终能从 ``config.rope_theta`` 读到正确值（与 transformers 版本无关）。
+        rope_params = kwargs.pop("rope_parameters", None)
+        if rope_params is not None:
+            if isinstance(rope_params, dict):
+                rope_theta = rope_params.get("rope_theta", rope_theta)
+                rope_scaling = rope_params.get("rope_scaling", rope_scaling)
+            else:
+                rope_theta = getattr(rope_params, "rope_theta", rope_theta)
+                rope_scaling = getattr(rope_params, "rope_scaling", rope_scaling)
+        super().__init__(**emit_rope_kwargs(Qwen3Config, rope_theta, rope_scaling), **kwargs)
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
         self.rope_theta_hw = rope_theta_hw
         self.max_position_embeddings_hw = max_position_embeddings_hw
 
@@ -45,6 +71,8 @@ class NEOMoELLMConfig(Qwen3MoeConfig):
 
     def __init__(
         self,
+        rope_theta=10000.0,
+        rope_scaling=None,
         rope_theta_hw=10000.0,
         max_position_embeddings_hw=10000,
         gen_num_experts=None,
@@ -52,7 +80,18 @@ class NEOMoELLMConfig(Qwen3MoeConfig):
         gen_moe_intermediate_size=None,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        # 同 NEOLLMConfig：把 5.x 的 rope_parameters 与 4.x 的 rope_theta/rope_scaling 归一化。
+        rope_params = kwargs.pop("rope_parameters", None)
+        if rope_params is not None:
+            if isinstance(rope_params, dict):
+                rope_theta = rope_params.get("rope_theta", rope_theta)
+                rope_scaling = rope_params.get("rope_scaling", rope_scaling)
+            else:
+                rope_theta = getattr(rope_params, "rope_theta", rope_theta)
+                rope_scaling = getattr(rope_params, "rope_scaling", rope_scaling)
+        super().__init__(**emit_rope_kwargs(Qwen3MoeConfig, rope_theta, rope_scaling), **kwargs)
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
         self.rope_theta_hw = rope_theta_hw
         self.max_position_embeddings_hw = max_position_embeddings_hw
 

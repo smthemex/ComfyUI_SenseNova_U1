@@ -7,31 +7,33 @@ from torch import nn
 import copy
 import math
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.generation import GenerationMixin
-try:
-    from transformers.integrations import use_kernel_forward_from_hub
-except ImportError:  # pragma: no cover - fallback for older transformers
-    def use_kernel_forward_from_hub(_kernel_name: str):
-        # No-op decorator when the integration is unavailable.
-        def _decorator(module_cls):
-            return module_cls
-from transformers.masking_utils import create_causal_mask
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import (
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers import Qwen3Config
+
+# 所有版本敏感符号统一从 transformers_compat 取，杜绝硬编码某一版 transformers 内部路径。
+from .transformers_compat import (
+    ALL_ATTENTION_FUNCTIONS,
+    FlashAttentionKwargs,
     GenericForQuestionAnswering,
     GenericForSequenceClassification,
     GenericForTokenClassification,
+    GenerationMixin,
     GradientCheckpointingLayer,
+    ROPE_INIT_FUNCTIONS,
+    TransformersKwargs,
+    Unpack,
+    auto_docstring,
+    build_causal_mask_kwargs,
+    can_return_tuple,
+    check_model_inputs,
+    create_causal_mask,
+    deprecate_kwarg,
+    dynamic_rope_update,
+    make_dynamic_cache,
+    PreTrainedModel,
+    use_kernel_forward_from_hub,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
-from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import check_model_inputs
-from transformers import Qwen3Config
 
 try:
     from flash_attn import flash_attn_func  # type: ignore
@@ -361,6 +363,18 @@ class Qwen3RotaryEmbedding(nn.Module):
             sin = emb.sin() * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+    def compute_default_rope_parameters(self, config=None, device=None):
+        """Version-independent rope parameter computation.
+
+        transformers >=5.x ``PreTrainedModel._init_weights`` invokes this method
+        on any ``*RotaryEmbedding`` module that exposes an ``original_inv_freq``
+        buffer. We delegate to the bundled ``_compute_default_rope_parameters``
+        so the model never depends on the exact rope table shipped by a given
+        transformers release.
+        """
+        cfg = config if config is not None else self.config
+        return _compute_default_rope_parameters(cfg, device)
 
 
 class Qwen3Attention(nn.Module):
@@ -1084,7 +1098,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            past_key_values = make_dynamic_cache(self.config)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -1099,14 +1113,15 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if not isinstance(causal_mask_mapping := attention_mask, dict):
             # Prepare mask arguments
             if input_ids is not None:
-                mask_kwargs = {
-                    "config": self.config,
-                    "input_embeds": inputs_embeds,
-                    "attention_mask": attention_mask,
-                    "cache_position": cache_position,
-                    "past_key_values": past_key_values,
-                    "position_ids": position_ids,
-                }
+                mask_kwargs = build_causal_mask_kwargs(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    sliding_window=getattr(self.config, "sliding_window", None),
+                    cache_position=cache_position,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                    config=self.config,
+                )
                 # Create the masks
                 causal_mask_mapping = {
                     "full_attention": create_causal_mask(**mask_kwargs),

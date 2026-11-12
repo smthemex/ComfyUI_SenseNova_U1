@@ -4,17 +4,25 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.generation import GenerationMixin
-from transformers.masking_utils import create_causal_mask
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import GradientCheckpointingLayer
+from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.modeling_utils import PreTrainedModel
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
-from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import check_model_inputs
+
+# 所有版本敏感符号统一从 transformers_compat 取，杜绝硬编码某一版 transformers 内部路径。
+from .transformers_compat import (
+    FlashAttentionKwargs,
+    GradientCheckpointingLayer,
+    GenerationMixin,
+    TransformersKwargs,
+    Unpack,
+    auto_docstring,
+    build_causal_mask_kwargs,
+    can_return_tuple,
+    check_model_inputs,
+    create_causal_mask,
+    deprecate_kwarg,
+    make_dynamic_cache,
+    PreTrainedModel,
+)
 
 from .configuration_neo_chat import NEOMoELLMConfig
 from .modeling_qwen3 import (
@@ -406,7 +414,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            past_key_values = make_dynamic_cache(self.config)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -419,14 +427,15 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
         if not isinstance(causal_mask_mapping := attention_mask, dict):
             if input_ids is not None:
-                mask_kwargs = {
-                    "config": self.config,
-                    "input_embeds": inputs_embeds,
-                    "attention_mask": attention_mask,
-                    "cache_position": cache_position,
-                    "past_key_values": past_key_values,
-                    "position_ids": position_ids,
-                }
+                mask_kwargs = build_causal_mask_kwargs(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    sliding_window=getattr(self.config, "sliding_window", None),
+                    cache_position=cache_position,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                    config=self.config,
+                )
                 causal_mask_mapping = {
                     "full_attention": create_causal_mask(**mask_kwargs),
                 }
