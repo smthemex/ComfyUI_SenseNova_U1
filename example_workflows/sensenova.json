@@ -25,11 +25,20 @@
           "link": 5
         }
       ],
-      "outputs": [],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": null
+        }
+      ],
       "properties": {},
       "widgets_values": [
         "ComfyUI"
-      ]
+      ],
+      "widgets_values_named": {
+        "filename_prefix": "ComfyUI"
+      }
     },
     {
       "id": 4,
@@ -51,6 +60,9 @@
       "widgets_values": [
         " 1. image mode only useful  if you link a image\n 2 .txt2image  or  txt2image with interleave\n 3. think mode will take long times to infer\n\n\n 1.  图片模式只在连入图片时生效\n 2 .文生图模式 还有 interleave 模式 （image mode 选择 interleave）\n 3. 思考模式很耗时，效果当然好\n\n"
       ],
+      "widgets_values_named": {
+        "text": " 1. image mode only useful  if you link a image\n 2 .txt2image  or  txt2image with interleave\n 3. think mode will take long times to infer\n\n\n 1.  图片模式只在连入图片时生效\n 2 .文生图模式 还有 interleave 模式 （image mode 选择 interleave）\n 3. 思考模式很耗时，效果当然好\n\n"
+      },
       "color": "#432",
       "bgcolor": "#653"
     },
@@ -58,8 +70,8 @@
       "id": 1,
       "type": "SenseNova_SM_Model",
       "pos": [
-        21335.0151409047,
-        -532.4174557209343
+        21352.606085238538,
+        -482.0433393300717
       ],
       "size": [
         439.44721069576553,
@@ -82,11 +94,17 @@
         "Node name for S&R": "SenseNova_SM_Model"
       },
       "widgets_values": [
+        "SenseNova-U1.5-8B-MoT-SFT_fp8_scaled.safetensors",
         "none",
-        "SenseNova-U1-8B-MoT-8step-Q6_K.gguf",
-        "none",
+        "SenseNova-U1.5-8B-MoT-LoRA-8step-V2.safetensors",
         "auto"
-      ]
+      ],
+      "widgets_values_named": {
+        "diffusion_models": "SenseNova-U1.5-8B-MoT-SFT_fp8_scaled.safetensors",
+        "gguf": "none",
+        "lora": "SenseNova-U1.5-8B-MoT-LoRA-8step-V2.safetensors",
+        "attn_backend": "auto"
+      }
     },
     {
       "id": 6,
@@ -96,8 +114,8 @@
         -471.7404623567197
       ],
       "size": [
-        400,
-        588
+        427.9856844770654,
+        729.1737141330907
       ],
       "flags": {},
       "order": 2,
@@ -134,8 +152,8 @@
       },
       "widgets_values": [
         "edit",
-        "讲一下经典童话《卖火柴的小女孩》，但这次请给出一个温暖的平行宇宙改编版图文绘本。在最后一次擦亮火柴时，出现的不是幻象，而是一只拥有魔法的驯鹿，它载着小女孩飞向了有糖果和壁炉的城堡",
-        783151489,
+        "暗调复古时尚人像摄影，9:16竖版全身构图，镜头从人物斜前方低机位拍摄，人物位于画面中央，呈现大胆随性的街头蹲姿。成年东亚女性，身材窈窕，骨架纤秀，肩线小巧，颈项修长，胸部丰盈，腰肢紧窄，臀部圆润，大腿饱满紧致，肌肤白皙。\n\n乌黑浓密的长卷发凌乱披散，蓬松发根略微隆起，大片波浪发丝遮住半边脸颊，垂落胸前与腰侧。精致鹅蛋脸，深邃杏眼，细长上挑眼线，浓密睫毛，鼻梁挺秀，嘴唇丰润。头部微微偏向镜头，半垂的眼睑下透出冷淡目光，眉心松弛，唇瓣轻抿，嘴角几乎没有弧度，呈现倦怠、疏离又略带挑衅的微表情。\n\n人物深蹲在灰色水泥地面上，身体朝画面左侧呈三分之二侧身，臀部下沉接近脚跟，上半身略微前倾，双膝大幅弯曲并拢，腿部折叠形成鲜明曲线。一侧手臂屈肘高举，手指夹着细长香烟，烟雾向上缓缓飘散，另一只手臂隐于宽大衣袖后方。\n\n身穿浅湖蓝色蓬松人造皮草外套，浓密长绒覆盖肩背与手臂，宽大袖口堆积于手腕。衣摆自然敞开，下方露出白色蕾丝短裤，精细花边贴合臀部。双腿穿黑色透明波点丝袜，波点延伸在大腿中部以白色蕾丝边作为袜口，圆形植绒图案均匀排列，搭配银白色亮片厚水台细高跟鞋。\n\n背景为昏暗空旷的室内水泥空间，深灰墙面与粗糙地面隐入阴影。顶部冷白光勾勒发丝与皮草边缘，画面带有明显胶片噪点、轻微失焦和低清晰度闪光摄影质感，呈现颓靡、冷艳的地下时尚氛围。",
+        998671481,
         "randomize",
         8,
         "1:1",
@@ -154,7 +172,30 @@
         0.9,
         0,
         0
-      ]
+      ],
+      "widgets_values_named": {
+        "img_mode": "edit",
+        "prompt": "暗调复古时尚人像摄影，9:16竖版全身构图，镜头从人物斜前方低机位拍摄，人物位于画面中央，呈现大胆随性的街头蹲姿。成年东亚女性，身材窈窕，骨架纤秀，肩线小巧，颈项修长，胸部丰盈，腰肢紧窄，臀部圆润，大腿饱满紧致，肌肤白皙。\n\n乌黑浓密的长卷发凌乱披散，蓬松发根略微隆起，大片波浪发丝遮住半边脸颊，垂落胸前与腰侧。精致鹅蛋脸，深邃杏眼，细长上挑眼线，浓密睫毛，鼻梁挺秀，嘴唇丰润。头部微微偏向镜头，半垂的眼睑下透出冷淡目光，眉心松弛，唇瓣轻抿，嘴角几乎没有弧度，呈现倦怠、疏离又略带挑衅的微表情。\n\n人物深蹲在灰色水泥地面上，身体朝画面左侧呈三分之二侧身，臀部下沉接近脚跟，上半身略微前倾，双膝大幅弯曲并拢，腿部折叠形成鲜明曲线。一侧手臂屈肘高举，手指夹着细长香烟，烟雾向上缓缓飘散，另一只手臂隐于宽大衣袖后方。\n\n身穿浅湖蓝色蓬松人造皮草外套，浓密长绒覆盖肩背与手臂，宽大袖口堆积于手腕。衣摆自然敞开，下方露出白色蕾丝短裤，精细花边贴合臀部。双腿穿黑色透明波点丝袜，波点延伸在大腿中部以白色蕾丝边作为袜口，圆形植绒图案均匀排列，搭配银白色亮片厚水台细高跟鞋。\n\n背景为昏暗空旷的室内水泥空间，深灰墙面与粗糙地面隐入阴影。顶部冷白光勾勒发丝与皮草边缘，画面带有明显胶片噪点、轻微失焦和低清晰度闪光摄影质感，呈现颓靡、冷艳的地下时尚氛围。",
+        "seed": 998671481,
+        "control_after_generate": "randomize",
+        "steps": 8,
+        "target_pixels": "1:1",
+        "cfg": 1,
+        "img_cfg": 1,
+        "timestep_shift": 3,
+        "batch_size": 1,
+        "prefetch_count": 1,
+        "interleave_max": 2,
+        "cfg_norm": "none",
+        "enhance": false,
+        "think_mode": false,
+        "do_sample": true,
+        "max_new_tokens": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 0,
+        "repetition_penalty": 0
+      }
     }
   ],
   "links": [
@@ -179,13 +220,13 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 1.0438649653044214,
+      "scale": 1.000513403483489,
       "offset": [
-        -21240.289523546486,
-        682.9481410099086
+        -21106.127518572488,
+        621.6744285995326
       ]
     },
-    "frontendVersion": "1.42.11",
+    "frontendVersion": "1.58.5",
     "VHS_latentpreview": false,
     "VHS_latentpreviewrate": 0,
     "VHS_MetadataImage": true,

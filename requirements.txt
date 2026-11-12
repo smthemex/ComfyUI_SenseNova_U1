@@ -1,8 +1,13 @@
 torch
 diffusers
 torchvision
-transformers >=4.57.1, < 4.58.0
+transformers
 accelerate
 tqdm
 gguf
-tokenizers
+safetensors
+httpx
+packaging
+# Optional, do NOT list here: python-dotenv (only loads a local .env file into
+# os.environ; the enhancer reads plain env vars), flash-attn (needs a local wheel),
+# comfy_kitchen (bundled with ComfyUI and has an in-plugin fallback).

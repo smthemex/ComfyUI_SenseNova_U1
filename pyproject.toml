@@ -3,7 +3,7 @@ name = "sensenova_u1"
 description = "SenseNova-U1: Unifying Multimodal Understanding and Generation with NEO-Unify Architecture"
 version = "1.0.0"
 license = {file = "LICENSE"}
-dependencies = ["torch", "diffusers", "torchvision", "transformers # < 4.58.0", "accelerate", "tqdm", "gguf", "tokenizers"]
+dependencies = ["torch", "diffusers", "torchvision", "transformers", "accelerate", "tqdm", "gguf", "safetensors", "httpx", "packaging"]
 
 [project.urls]
 Repository = "https://github.com/smthemex/ComfyUI_SenseNova_U1"

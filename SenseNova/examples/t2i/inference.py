@@ -361,11 +361,18 @@ def _build_enhancer(enhance):
         return None, None
     import asyncio
 
-    from dotenv import load_dotenv
+    # python-dotenv is optional: it only injects a local .env file into
+    # os.environ. The enhancer reads U1_ENHANCE_* via plain os.environ, so
+    # real environment variables work without this package.
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        load_dotenv = None
 
     from ...src.sensenova_u1.prompt_enhance import PromptEnhancer
 
-    load_dotenv()
+    if load_dotenv is not None:
+        load_dotenv()
     enhancer = PromptEnhancer.from_env(style="infographic")
     if enhancer is None:
        return None, None

@@ -4,7 +4,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from transformers.modeling_outputs import BaseModelOutputWithPooling
-from transformers.modeling_utils import PreTrainedModel
+from .transformers_compat import PreTrainedModel
 
 from .configuration_neo_vit import NEOVisionConfig
 
